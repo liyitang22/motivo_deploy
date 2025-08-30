@@ -1,4 +1,5 @@
 from .base import Observation, ObsGroup
 
-from .basic import *
-from .hdmi import *
+# from .basic import *
+# from .hdmi import *
+from .motivo import *

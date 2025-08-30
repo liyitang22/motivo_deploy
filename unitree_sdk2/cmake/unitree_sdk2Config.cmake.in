@@ -1,4 +1,3 @@
-include(CMakeFindDependencyMacro)
 
 # Same syntax as find_package
 find_dependency(Threads REQUIRED)

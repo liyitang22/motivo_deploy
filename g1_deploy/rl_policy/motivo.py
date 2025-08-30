@@ -7,15 +7,19 @@ from typing import List, Dict, Any, Type
 import sched
 from termcolor import colored
 from sshkeyboard import listen_keyboard
+from pathlib import Path
+import math
+import torch.nn.functional as F
+import joblib
 
 
 sys.path.append(".")
 # Ensure g1_interface can be imported
 sys.path.append("/home/unitree/haoyang_deploy/unitree_sdk2/build/lib")
-try:
-    import g1_interface  # type: ignore
-except ImportError as e:
-    raise ImportError("g1_interface module not found. Make sure it is built and added to PYTHONPATH.")
+# try:
+#     import g1_interface  # type: ignore
+# except ImportError as e:
+#     raise ImportError("g1_interface module not found. Make sure it is built and added to PYTHONPATH.")
 
 from loguru import logger
 
@@ -23,223 +27,46 @@ from loguru import logger
 from utils.strings import resolve_matching_names_values, unitree_joint_names
 from utils.onnx_module import Timer
 from rl_policy.observations import Observation, ObsGroup
-
-class G1StateProcessor:
-    """Light-weight state processor reading data directly from ``g1_interface``.
-
-    This class provides the minimal subset of attributes/methods expected by the
-    existing observation modules so that they remain drop-in compatible.
-    """
-
-    def __init__(self, robot: "g1_interface.G1Interface", dest_joint_names: List[str]):
-        self.robot = robot
-
-        # Mapping from Isaac order (policy / sim order) to the internal Unitree order
-        self.num_dof = len(dest_joint_names)
-        self.joint_indices_in_source = [unitree_joint_names.index(name) for name in dest_joint_names]
-
-        # Isaac style qpos / qvel buffers (same layout as original ``StateProcessor``)
-        self.qpos = np.zeros(3 + 4 + self.num_dof)
-        self.qvel = np.zeros(3 + 3 + self.num_dof)
-
-        self.root_pos_w = self.qpos[0:3]
-        self.root_lin_vel_w = self.qvel[0:3]
-
-        self.root_quat_b = self.qpos[3:7]
-        self.root_ang_vel_b = self.qvel[3:6]
-
-        self.joint_pos = self.qpos[7:]
-        self.joint_vel = self.qvel[6:]
-
-        self.zmq_context = zmq.Context()
-        self.mocap_subscribers: Dict[str, zmq.Socket] = {}
-        self.mocap_threads: Dict[str, threading.Thread] = {}
-        self.mocap_data: Dict[str, Any] = {}
-        self.mocap_data_lock = threading.Lock()
-
-    def register_subscriber(self, object_name: str, port: int):
-        if object_name in self.mocap_subscribers:
-            return
-        from utils.common import MOCAP_IP
-        socket = self.zmq_context.socket(zmq.SUB)
-        socket.connect(f"tcp://{MOCAP_IP}:{port}")
-        socket.setsockopt(zmq.SUBSCRIBE, object_name.encode())
-        socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms
-        self.mocap_subscribers[object_name] = socket
-
-        def _sub_thread(obj_name: str):
-            while True:
-                try:
-                    msg = socket.recv_multipart(zmq.NOBLOCK)
-                    if len(msg) == 2:
-                        name = msg[0].decode()
-                        data = np.frombuffer(msg[1], dtype=np.float64)
-                        if len(data) == 7:
-                            pos, quat = data[:3].copy(), data[3:].copy()
-                            with self.mocap_data_lock:
-                                self.mocap_data[f"{name}_pos"] = pos
-                                self.mocap_data[f"{name}_quat"] = quat
-                except zmq.Again:
-                    time.sleep(0.001)
-                except Exception as e:
-                    logger.warning(f"{obj_name} subscriber error: {e}")
-                    time.sleep(0.01)
-        th = threading.Thread(target=_sub_thread, args=(object_name,), daemon=True)
-        th.start()
-        self.mocap_threads[object_name] = th
-
-    def get_mocap_data(self, key: str):
-        with self.mocap_data_lock:
-            return self.mocap_data.get(key, None)
-
-    # ------------------------------------------------------------------
-    # Low-state preparation (called every control / RL step)
-    # ------------------------------------------------------------------
-    def _prepare_low_state(self) -> bool:
-        try:
-            state = self.robot.read_low_state()
-        except Exception as e:
-            logger.warning(f"Failed to read G1 low state: {e}")
-            return False
-
-        if state is None:
-            return False
-
-        # IMU
-        self.root_quat_b[:] = state.imu.quat  # [w, x, y, z]
-        self.root_ang_vel_b[:] = state.imu.omega
-
-        # Joints
-        for dst_idx, src_idx in enumerate(self.joint_indices_in_source):
-            self.joint_pos[dst_idx] = state.motor.q[src_idx]
-            self.joint_vel[dst_idx] = state.motor.dq[src_idx]
-        return True
-
-
-# -------------------------------------------------------------------------------------------------
-# Command sender wrapping MotorCommand for G1
-# -------------------------------------------------------------------------------------------------
-class G1CommandSender:
-    """Thin wrapper translating Isaace style command arrays to ``MotorCommand``."""
-
-    def __init__(
-        self,
-        robot: "g1_interface.G1Interface",
-        policy_config: Dict[str, Any],
-    ):
-        """Create a command sender using policy-specified gains.
-
-        Args:
-            robot:          Active ``g1_interface`` instance.
-            dest_joint_names:  Joint order used by the policy (Isaac order).
-            policy_config:  Dict containing ``joint_kp``, ``joint_kd``, and ``default_joint_pos``.
-        """
-
-        self.robot = robot
-        self.policy_config = policy_config
-        # init robot and kp kd
-        self._kp_level = 1.0  # 0.1
-
-        joint_kp_dict = self.policy_config["joint_kp"]
-        joint_indices, joint_names, joint_kp = resolve_matching_names_values(
-            joint_kp_dict,
-            unitree_joint_names,
-            preserve_order=True,
-            strict=False,
-        )
-        self.joint_kp_unitree_default = np.zeros(len(unitree_joint_names))
-        self.joint_kp_unitree_default[joint_indices] = joint_kp
-        self.joint_kp_unitree = self.joint_kp_unitree_default.copy()
-
-        joint_kd_dict = self.policy_config["joint_kd"]
-        joint_indices, joint_names, joint_kd = resolve_matching_names_values(
-            joint_kd_dict,
-            unitree_joint_names,
-            preserve_order=True,
-            strict=False,
-        )
-        self.joint_kd_unitree = np.zeros(len(unitree_joint_names))
-        self.joint_kd_unitree[joint_indices] = joint_kd
-
-        default_joint_pos_dict = self.policy_config["default_joint_pos"]
-        joint_indices, joint_names, default_joint_pos = resolve_matching_names_values(
-            default_joint_pos_dict,
-            unitree_joint_names,
-            preserve_order=True,
-            strict=False,
-        )
-        self.default_joint_pos_unitree = np.zeros(len(unitree_joint_names))
-        self.default_joint_pos_unitree[joint_indices] = default_joint_pos
-
-        joint_names_isaac = self.policy_config["isaac_joint_names"]
-        self.joint_indices_unitree = [unitree_joint_names.index(name) for name in joint_names_isaac]
-
-    # Expose kp_level so it can be tuned by UI callbacks (same API as original)
-    @property
-    def kp_level(self) -> float:
-        return self._kp_level
-
-    @kp_level.setter
-    def kp_level(self, value: float):
-        self._kp_level = float(value)
-
-    # --------------------------------------------------------------
-    # Core API expected by BasePolicy
-    # --------------------------------------------------------------
-    def send_command(self, cmd_q: np.ndarray, cmd_dq: np.ndarray, cmd_tau: np.ndarray):
-        """Construct a ``MotorCommand`` and dispatch it via the interface."""
-        cmd = self.robot.create_zero_command()
-
-        # Apply kp_level scaling (kd remains constant, consistent with original implementation)
-        kp_scaled = self.joint_kp_unitree * self._kp_level
-        kd_scaled = self.joint_kd_unitree
-
-        q_target = list(cmd.q_target)
-        dq_target = list(cmd.dq_target)
-        tau_ff = list(cmd.tau_ff)
-        kp = list(cmd.kp)
-        kd = list(cmd.kd)
-        for i_policy, idx_unitree in enumerate(self.joint_indices_unitree):
-            q_target[idx_unitree] = float(cmd_q[i_policy])
-            dq_target[idx_unitree] = float(cmd_dq[i_policy])
-            tau_ff[idx_unitree] = float(cmd_tau[i_policy])
-            kp[idx_unitree] = float(kp_scaled[idx_unitree])
-            kd[idx_unitree] = float(kd_scaled[idx_unitree])
-
-        cmd.q_target = q_target
-        cmd.dq_target = dq_target
-        cmd.tau_ff = tau_ff
-        cmd.kp = kp
-        cmd.kd = kd
-
-        self.robot.write_low_command(cmd)
-
-
+from rl_policy.utils.state_processor import StateProcessor
+from rl_policy.utils.command_sender import CommandSender
 # -------------------------------------------------------------------------------------------------
 # High-level RL policy that plugs into the existing framework
 # -------------------------------------------------------------------------------------------------
-class G1Policy:
+class MotivoPolicy:
     def __init__(
         self,
         robot_config: Dict[str, Any],
         policy_config: Dict[str, Any],
+        exp_config: Dict[str, Any],
         model_path: str,
         rl_rate: int = 50,
     ) -> None:
-        network_interface = robot_config.get("INTERFACE", None)
-        # Create shared G1 interface instance
-        self.robot = g1_interface.G1Interface(network_interface)
-        # Ensure we are in PR mode (most policies work in PR)
-        try:
-            self.robot.set_control_mode(g1_interface.ControlMode.PR)
-        except Exception:
-            pass  # Ignore if firmware already in the correct mode
-
+        robot_type = robot_config["ROBOT_TYPE"]
+        if robot_type != "g1_real":
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+            if robot_config.get("INTERFACE", None):
+                ChannelFactoryInitialize(robot_config["DOMAIN_ID"], robot_config["INTERFACE"])
+            else:
+                ChannelFactoryInitialize(robot_config["DOMAIN_ID"])
+        else:
+            sys.path.append("/home/elijah/haoyang_deploy/unitree_sdk2/build/lib")
+            import g1_interface
+        
+            network_interface = robot_config.get("INTERFACE", None)
+            # Create shared G1 interface instance
+            self.robot = g1_interface.G1Interface(network_interface)
+            # Ensure we are in PR mode (most policies work in PR)
+            try:
+                self.robot.set_control_mode(g1_interface.ControlMode.PR)
+            except Exception:
+                pass  # Ignore if firmware already in the correct mode
+            robot_config["robot"] = self.robot
         # Plug-in our custom state processor & command sender
-        self.state_processor = G1StateProcessor(self.robot, policy_config["isaac_joint_names"])
-        self.command_sender = G1CommandSender(self.robot, policy_config)
+        self.state_processor = StateProcessor(robot_config, policy_config["isaac_joint_names"])
+        self.command_sender = CommandSender(robot_config, policy_config)
 
         self.rl_dt = 1.0 / rl_rate
+        self.t = 0
 
         self.policy_config = policy_config
 
@@ -257,6 +84,7 @@ class G1Policy:
             strict=False,
         )
         self.default_dof_angles = np.zeros(len(self.isaac_joint_names))
+        self.last_action  = np.zeros(len(self.isaac_joint_names))
         self.default_dof_angles[joint_indices] = default_joint_pos
 
         action_scale_cfg = policy_config["action_scale"]
@@ -318,6 +146,7 @@ class G1Policy:
             self.last_wc_msg = self.robot.read_wireless_controller()
             print("Wireless Controller Initialized")
         else:
+            import threading
             print("Using keyboard")
             self.use_joystick = False
             self.key_listener_thread = threading.Thread(
@@ -327,6 +156,37 @@ class G1Policy:
 
         # Setup observations after all processors are ready
         self.setup_observations()
+
+        # for test
+        self.exp_config = exp_config
+        self.task_type = exp_config['type']
+        self.start_motion = False
+
+        if self.task_type == "tracking":
+            ctx_path = Path(model_path).parent / exp_config['ctx_path']
+            self.ctx = joblib.load(ctx_path)
+            self.t_start = exp_config['start']
+            self.t_end = exp_config['end']
+            self.t_stop = exp_config['stop']
+            
+        elif self.task_type == "reward":
+            self.z_index = 0
+            import pickle
+            with open(Path(model_path).parent.parent / "reward_inference" / exp_config['ctx_path'], "rb") as f:
+                self.z_dict = pickle.load(f)
+            if "selected_rewards" in exp_config:
+               selected_rewards = exp_config['selected_rewards'] 
+            else:
+                selected_rewards = self.z_dict.keys()
+                
+            self.z_dict = {
+                k: v for k, v in self.z_dict.items() if k in selected_rewards
+            }
+            self.num_rewards = len(selected_rewards)
+        elif self.task_type == "single":
+            self.z_index = 0
+            self.z = np.array(exp_config["Iteration 0 z"])
+            
 
 
     def setup_policy(self, model_path):
@@ -373,7 +233,43 @@ class G1Policy:
         for obs_group in self.observations.values():
             obs = obs_group.compute()
             obs_dict[obs_group.name] = obs[None, :].astype(np.float32)
-        return obs_dict, np.concatenate([obs_dict[name] for name in obs_dict.keys()], axis=1)
+        
+        obs = obs_dict[obs_group.name]
+        obs[:, 64:93] = self.last_action
+        self.state_dict["action"] = self.last_action
+        self.state_dict["dof_pos_minus_default"] = obs[:, 0:29]
+        self.state_dict["dof_vel"] = obs[:, 29:58]
+        self.state_dict["projected_gravity"] = obs[:, 58:61]
+        self.state_dict["root_ang_vel_b"] = obs[:, 61:64]
+        self.update()
+
+        if self.task_type == "tracking":
+            gamma = 0.8  # 折扣因子
+            window = self.ctx[self.t:self.t+3]  # 取出窗口
+
+            discounts = gamma ** np.arange(len(window))  # 生成折扣权重：[1, gamma, gamma^2, ...]
+            discounts = discounts / np.sum(discounts)    # 归一化成平均权重
+
+            # 加权平均                                                                                                                                                                         
+            discounted_avg = np.sum(window * discounts[:, np.newaxis], axis=0)
+            discounted_avg = discounted_avg / np.linalg.norm(discounted_avg, axis=-1) * 16
+            
+            inputs = np.concatenate([obs, discounted_avg[np.newaxis, :]], axis= -1).astype(np.float32)
+            # inputs = np.concatenate([obs, list(self.z_dict.values())[self.z_index].cpu()], axis=-1).astype(np.float32)
+            if self.use_policy_action:
+                if self.start_motion and self.t < self.t_end:
+                    self.t += 1
+                    self.t = self.t % self.ctx.shape[0]
+                    print(self.t)
+                else:
+                    self.t = self.t_stop
+                    self.start_motion = False
+            
+        elif self.task_type == "reward":
+            inputs = np.concatenate([obs, list(self.z_dict.values())[self.z_index].cpu()], axis=-1).astype(np.float32)
+        elif self.task_type == "single":
+            inputs = np.concatenate([obs, self.z[np.newaxis, :]], axis=-1).astype(np.float32)
+        return obs_dict, inputs
 
     def get_init_target(self):
         if self.init_count > 500:
@@ -432,18 +328,16 @@ class G1Policy:
         try:
             with Timer(self.perf_dict, "prepare_obs"):
                 # Prepare observations
-                self.update()
                 obs_dict, observations = self.prepare_obs_for_rl()
-                self.state_dict.update(obs_dict)
                 self.state_dict["is_init"] = np.zeros(1, dtype=bool)
 
-            with Timer(self.perf_dict, "policy"):   
+            with Timer(self.perf_dict, "policy"):  
                 # Inference
-                action, self.state_dict = self.policy(observations)
+                action = self.policy(observations)
                 # Clip policy action
-                action = action.clip(-100, 100)
+                action = action.clip(-1, 1)
                 action_scaled = 5 * action
-                self.state_dict["action"] = action_scaled 
+                self.last_action = action_scaled
         except Exception as e:
             print(f"Error in policy inference: {e}")
             self.state_dict["action"] = np.zeros(self.num_actions)
@@ -457,11 +351,14 @@ class G1Policy:
                 q_target = self.state_processor.joint_pos
             else:
                 policy_action = np.zeros((self.num_dofs))
-                policy_action[self.controlled_joint_indices] = self.state_dict["action"]
+                policy_action[self.controlled_joint_indices] = action_scaled
                 policy_action = policy_action * self.action_scale
+                # policy_action *= 0
+                # policy_action[0] += 1
                 q_target = policy_action + self.default_dof_angles
 
             # Clip q target
+            # print(self.joint_pos_lower_limit)
             q_target = np.clip(
                 q_target, self.joint_pos_lower_limit, self.joint_pos_upper_limit
             )
@@ -520,6 +417,9 @@ class G1Policy:
             self.get_ready_state = True
             self.init_count = 0
             logger.info(colored("Setting to init state", "blue"))
+        elif cur_key == "B":
+            self.start_motion = True
+            self.t = self.t_start
         # elif cur_key == "Y+left":
         #     self.command_sender.kp_level -= 0.1
         # elif cur_key == "Y+right":
@@ -548,31 +448,119 @@ class G1Policy:
         listener.join()
 
     def handle_keyboard_button(self, keycode):
-        """Mirrors BasePolicy keyboard shortcuts."""
         if keycode == "]":
             self.use_policy_action = True
+            self.t = self.t_stop
             self.get_ready_state = False
             logger.info("Using policy actions")
-            self.phase = 0.0  # type: ignore
+            # self.frame_start_time = time.perf_counter()
+            self.phase = 0.0
+        elif keycode == "[":
+            self.start_motion = True
+            self.t = self.t_start
+        elif keycode == "n":
+            if self.task_type == "reward":
+                if self.z_index >= self.num_rewards - 1:
+                    self.z_index = 0
+                else:
+                    self.z_index += 1
+            elif self.task_type == "single":
+                self.z_index += 1
+                self.z = np.array(self.exp_config[f"Best z"])
+                print({self.z_index})
+        elif keycode == "p":
+            self.z_index = 0
+            self.start_motion = False
+            self.t = self.t_stop
+            logger.info("Resetting to stop state")
         elif keycode == "o":
             self.use_policy_action = False
             self.get_ready_state = False
             logger.info("Actions set to zero")
         elif keycode == "i":
-            self.use_policy_action = False
             self.get_ready_state = True
             self.init_count = 0
             logger.info("Setting to init state")
+        elif keycode == "w":
+            self.lin_vel_command[0, 0] += 0.1
+        elif keycode == "s":
+            self.lin_vel_command[0, 0] -= 0.1
+        elif keycode == "a":
+            self.lin_vel_command[0, 1] += 0.1
+        elif keycode == "d":
+            self.lin_vel_command[0, 1] -= 0.1
+        elif keycode == "q":
+            self.ang_vel_command[0, 0] -= 0.1
+        elif keycode == "e":
+            self.ang_vel_command[0, 0] += 0.1
+        elif keycode == "z":
+            self.ang_vel_command[0, 0] = 0.0
+            self.lin_vel_command[0, 0] = 0.0
+            self.lin_vel_command[0, 1] = 0.0
         elif keycode == "5":
             self.command_sender.kp_level -= 0.01
+            for i in range(len(self.command_sender.robot_kp)):
+                self.command_sender.robot_kp[i] = self.robot.MOTOR_KP[i] * self.command_sender.kp_level
+            logger.info(colored(f"Debug kp level: {self.command_sender.kp_level}", "green"))
+            logger.info(colored(f"Debug kp: {self.command_sender.robot_kp}", "green"))
         elif keycode == "6":
             self.command_sender.kp_level += 0.01
+            for i in range(len(self.command_sender.robot_kp)):
+                self.command_sender.robot_kp[i] = self.robot.MOTOR_KP[i] * self.command_sender.kp_level
+            logger.info(colored(f"Debug kp level: {self.command_sender.kp_level}", "green"))
+            logger.info(colored(f"Debug kp: {self.command_sender.robot_kp}", "green"))
         elif keycode == "4":
             self.command_sender.kp_level -= 0.1
+            for i in range(len(self.command_sender.robot_kp)):
+                self.command_sender.robot_kp[i] = self.robot.MOTOR_KP[i] * self.command_sender.kp_level
+            logger.info(colored(f"Debug kp level: {self.command_sender.kp_level}", "green"))
+            logger.info(colored(f"Debug kp: {self.command_sender.robot_kp}", "green"))
         elif keycode == "7":
             self.command_sender.kp_level += 0.1
+            for i in range(len(self.command_sender.robot_kp)):
+                self.command_sender.robot_kp[i] = self.robot.MOTOR_KP[i] * self.command_sender.kp_level
+            logger.info(colored(f"Debug kp level: {self.command_sender.kp_level}", "green"))
+            logger.info(colored(f"Debug kp: {self.command_sender.robot_kp}", "green"))
         elif keycode == "0":
             self.command_sender.kp_level = 1.0
-
-        if keycode in ["5", "6", "4", "7", "0"]:
+            for i in range(len(self.command_sender.robot_kp)):
+                self.command_sender.robot_kp[i] = self.robot.MOTOR_KP[i] * self.command_sender.kp_level
             logger.info(colored(f"Debug kp level: {self.command_sender.kp_level}", "green"))
+            logger.info(colored(f"Debug kp: {self.command_sender.robot_kp}", "green"))
+        if self.task_type == "reward":
+            print({self.z_index})
+        # import ipdb; ipdb.set_trace()
+            print(f"Testing reward {list(self.z_dict.keys())[self.z_index]}")
+
+
+if __name__ == "__main__":
+    import argparse
+    import yaml
+    parser = argparse.ArgumentParser(description="Robot")
+    parser.add_argument(
+        "--robot_config", type=str, default="config/robot/g1.yaml", help="robot config file"
+    )
+    parser.add_argument(
+        "--policy_config", type=str, help="policy config file"
+    )
+    parser.add_argument(
+        "--model_path", type=str, help="model path"
+    )
+    args = parser.parse_args()
+
+    with open(args.policy_config) as file:
+        policy_config = yaml.load(file, Loader=yaml.FullLoader)
+    with open(args.robot_config) as file:
+        robot_config = yaml.load(file, Loader=yaml.FullLoader)
+    with open("/home/yitang/Project/motivo_isaac/sim2real/config/exp/tracking.yaml") as file:
+        exp_config = yaml.load(file, Loader=yaml.FullLoader)
+    model_path = args.model_path
+
+    policy = MotivoPolicy(
+        robot_config=robot_config,
+        policy_config=policy_config,
+        model_path=model_path,
+        exp_config=exp_config,
+        rl_rate=50,
+    )
+    policy.run()

@@ -552,7 +552,7 @@ if __name__ == "__main__":
         policy_config = yaml.load(file, Loader=yaml.FullLoader)
     with open(args.robot_config) as file:
         robot_config = yaml.load(file, Loader=yaml.FullLoader)
-    with open("/home/yitang/Project/motivo_isaac/sim2real/config/exp/tracking.yaml") as file:
+    with open("config/exp/tracking.yaml") as file:
         exp_config = yaml.load(file, Loader=yaml.FullLoader)
     model_path = args.model_path
 

@@ -183,9 +183,21 @@ class MotivoPolicy:
                 k: v for k, v in self.z_dict.items() if k in selected_rewards
             }
             self.num_rewards = len(selected_rewards)
-        elif self.task_type == "single":
-            self.z_index = 0
-            self.z = np.array(exp_config["Iteration 0 z"])
+        elif self.task_type == "stiching":
+            ctx_path = Path(model_path).parent / exp_config['ctx_path']
+            pose_ctx_path = Path(model_path).parent / exp_config['pose_ctx_path']
+            self.ctx = joblib.load(ctx_path)
+            self.pose_ctx = joblib.load(pose_ctx_path)
+            self.t_start = exp_config['start']
+            self.t_end = exp_config['end']
+            self.t_stop = exp_config['stop']
+            self.t_interval = exp_config['t_interval']
+            self.pose_time = exp_config['pose_time']
+            self.pose_count_time = 0
+            self.pose_count = 0
+            self.start_pose = False
+            self.pose_list = exp_config['pose_list']
+
             
 
 
@@ -245,7 +257,7 @@ class MotivoPolicy:
 
         if self.task_type == "tracking":
             gamma = 0.8  # 折扣因子
-            window = self.ctx[self.t:self.t+3]  # 取出窗口
+            window = self.ctx[self.t:self.t+1]  # 取出窗口
 
             discounts = gamma ** np.arange(len(window))  # 生成折扣权重：[1, gamma, gamma^2, ...]
             discounts = discounts / np.sum(discounts)    # 归一化成平均权重
@@ -269,6 +281,36 @@ class MotivoPolicy:
             inputs = np.concatenate([obs, list(self.z_dict.values())[self.z_index].cpu()], axis=-1).astype(np.float32)
         elif self.task_type == "single":
             inputs = np.concatenate([obs, self.z[np.newaxis, :]], axis=-1).astype(np.float32)
+        elif self.task_type == "stiching":
+            inputs = np.concatenate([obs, self.ctx[self.t:self.t+1]], axis=-1).astype(np.float32)
+            if self.use_policy_action:
+                if self.start_pose == True:
+                    self.pose_count_time += 1
+                    print("pose", self.pose_count)
+                    inputs = np.concatenate([obs, self.pose_z], axis=-1).astype(np.float32)
+                    if self.pose_count_time % self.pose_time == 0:
+                        self.start_pose = False
+                        self.start_motion = True
+                        self.pose_count += 1
+                    
+                if self.start_motion and self.t < self.t_end:
+                    if self.t % self.t_interval == 0 and self.t != 0:
+                        self.start_pose = True
+                        self.start_motion = False
+                        print(f"start pose {self.pose_count}")
+                        self.pose_z = self.pose_ctx[self.pose_list[self.pose_count]:self.pose_list[self.pose_count]+1]
+                        inputs = np.concatenate([obs, self.pose_z], axis=-1).astype(np.float32)
+                        self.t += 1
+                        
+                    else:
+                        self.t += 1
+                        self.t = self.t % self.ctx.shape[0]
+                        inputs = np.concatenate([obs, self.ctx[self.t:self.t+1]], axis=-1).astype(np.float32)
+                        print(self.t)
+                elif self.start_pose == False:
+                    self.t = self.t_stop
+                    self.start_motion = False
+                    inputs = np.concatenate([obs, self.ctx[self.t:self.t+1]], axis=-1).astype(np.float32)
         return obs_dict, inputs
 
     def get_init_target(self):

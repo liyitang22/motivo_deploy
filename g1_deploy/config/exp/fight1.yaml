@@ -1,7 +1,16 @@
 type: tracking
-start: 0
-end: 19000
+start: 840
+end: 1270
 stop: 0
-ctx_path: zs_pulp.pkl
+ctx_path: zs_3.pkl
 # python -m humanoidverse.z_adaptation_new --model_folder=logs/motivo/aug21_29dof_newkpkd_arescale_ascale0.25_fall_ahist_newpush++pen_grad50_3/
 
+# 10050+ SPORT
+
+# type: tracking
+# start: 8000
+# end: 9000
+# stop: 0
+# ctx_path: zs_3.pkl
+
+#squat

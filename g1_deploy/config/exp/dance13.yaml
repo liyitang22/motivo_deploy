@@ -1,0 +1,6 @@
+type: tracking
+start: 0
+end: 80000
+stop: 0
+ctx_path: zs_1.pkl
+# python -m humanoidverse.z_adaptation_new --model_folder=logs/motivo/aug21_29dof_newkpkd_arescale_ascale0.25_fall_ahist_newpush++pen_grad50_3/

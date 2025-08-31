@@ -1,0 +1,13 @@
+type: stiching
+pose_ctx_path: zs_39.pkl
+# pose_ctx_path: zs_20.pkl
+pose_time: 200
+t_interval: 300
+start: 0
+end: 19000
+stop: 0
+ctx_path: zs_25.pkl
+pose_list: [340, 440, 580, 750, 870, 1150, 1230, 1350]
+# pose_list: [350, 1850, 1920, 2500]
+# python -m humanoidverse.z_adaptation_new --model_folder=logs/motivo/aug21_29dof_newkpkd_arescale_ascale0.25_fall_ahist_newpush++pen_grad50_3/
+

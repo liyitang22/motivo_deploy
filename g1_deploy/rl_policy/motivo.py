@@ -11,6 +11,7 @@ from pathlib import Path
 import math
 import torch.nn.functional as F
 import joblib
+import json
 
 
 sys.path.append(".")
@@ -197,6 +198,16 @@ class MotivoPolicy:
             self.pose_count = 0
             self.start_pose = False
             self.pose_list = exp_config['pose_list']
+
+            self.rl_log_buffer = []
+
+        import os
+        self.rl_log_buffer = []
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        self.rl_log_file = os.path.join(
+            log_dir, f"rl_step_log_sim2sim_walk2sj4.jsonl"
+        )
 
             
 
@@ -395,6 +406,12 @@ class MotivoPolicy:
                 policy_action = np.zeros((self.num_dofs))
                 policy_action[self.controlled_joint_indices] = action_scaled
                 policy_action = policy_action * self.action_scale
+                self.rl_log_buffer.append({
+                    "timestamp": time.time(),
+                    "obs": observations.tolist(),         # numpy → list
+                    "action_raw": action.tolist(),
+                    "action_scaled": policy_action.tolist(),
+                })
                 # policy_action *= 0
                 # policy_action[0] += 1
                 q_target = policy_action + self.default_dof_angles
@@ -414,6 +431,14 @@ class MotivoPolicy:
         elapsed = time.perf_counter() - loop_start
         if elapsed > self.rl_dt:
             logger.warning(f"RL step took {elapsed:.6f} seconds, expected {self.rl_dt} seconds")
+
+
+        if len(self.rl_log_buffer) >= 100:
+            print("store")
+            with open(self.rl_log_file, "a") as f:
+                for entry in self.rl_log_buffer:
+                    f.write(json.dumps(entry) + "\n")
+            self.rl_log_buffer.clear()
 
     def process_joystick_input(self):
         """Poll current wireless controller state and translate to high-level key events."""
@@ -594,7 +619,7 @@ if __name__ == "__main__":
         policy_config = yaml.load(file, Loader=yaml.FullLoader)
     with open(args.robot_config) as file:
         robot_config = yaml.load(file, Loader=yaml.FullLoader)
-    with open("config/exp/tracking.yaml") as file:
+    with open("config/exp/walk1_sj1-1.yaml") as file:
         exp_config = yaml.load(file, Loader=yaml.FullLoader)
     model_path = args.model_path
 
